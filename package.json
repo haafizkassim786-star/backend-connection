@@ -1,0 +1,22 @@
+{
+  "name": "tks-tracking-backend",
+  "version": "1.0.0",
+  "description": "Backend for TKS Courier & Cargo tracking system with Google Sheets integration",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "body-parser": "^2.2.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "googleapis": "^118.0.0",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
