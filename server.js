@@ -242,7 +242,7 @@ async function start() {
     const spreadsheetId = process.env.SPREADSHEET_ID;
     const serviceAccountPath =
       process.env.SERVICE_ACCOUNT_KEY_PATH ||
-      process.env.SERVICE_ACCOUNT_KEY_PATH || // fallback to old name if present
+      process.env.SERVICE_ACCOUNT_JSON || // fallback to old name if present
       '/etc/secrets/service-account.json';
 
     if (!spreadsheetId || !serviceAccountPath) {
