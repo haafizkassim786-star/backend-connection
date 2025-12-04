@@ -16,7 +16,7 @@
     "googleapis": "^118.0.0",
     "jsonwebtoken": "^9.0.2"
   },
-  "engines": {
-    "node": ">=16.0.0"
-  }
+ "engines": { "node": "18.x" }
+
 }
+
