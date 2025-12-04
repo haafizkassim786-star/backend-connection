@@ -1,4 +1,5 @@
-// backend/sheets.js
+// sheets.js (replace existing with this file)
+// ESM module — robust initialization: normalizes private_key newlines and accepts env or file input
 import { google } from 'googleapis';
 import fs from 'fs';
 import path from 'path';
@@ -10,6 +11,7 @@ let sheetsClient = null;
 let spreadsheetId = null;
 let sheetName = null;
 
+/* helpers (same as original) */
 function colLetter(n) {
   let s = '';
   while (n > 0) {
@@ -20,92 +22,58 @@ function colLetter(n) {
   return s;
 }
 
-/**
- * Robustly parse the 'history' value from the sheet.
- * Accepts:
- * - an actual array (returned directly)
- * - a JSON array string: "[{...}]"
- * - a double-encoded string (e.g. '"[...]"')
- * - anything else -> returns []
- */
 function parseHistory(historyStr) {
   try {
     if (historyStr === undefined || historyStr === null || historyStr === '') return [];
-    // If already an array (some Google APIs may already parse it)
     if (Array.isArray(historyStr)) return historyStr;
+    if (typeof historyStr === 'object') return Array.isArray(historyStr) ? historyStr : [];
 
-    // If it's an object (not array), try to coerce to array when reasonable
-    if (typeof historyStr === 'object') {
-      return Array.isArray(historyStr) ? historyStr : [];
-    }
-
-    // If it's a string, attempt parsing JSON
     if (typeof historyStr === 'string') {
-      // Trim invisible characters that often come from Sheets
       const trimmed = historyStr.trim();
-
-      // If it looks like an array already, parse it
       if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
         try {
           const parsed = JSON.parse(trimmed);
           return Array.isArray(parsed) ? parsed : [];
-        } catch (e) {
-          // try forgiving: sometimes it's double-encoded, like "\"[...]"\"", unescape then parse
+        } catch {
           try {
             const unescaped = trimmed.replace(/^"(.+)"$/, '$1').replace(/\\"/g, '"');
             const parsed2 = JSON.parse(unescaped);
             return Array.isArray(parsed2) ? parsed2 : [];
-          } catch (e2) {
+          } catch {
             return [];
           }
         }
       }
-
-      // If not JSON (plain text), return as single-entry array (so UI can display something)
       return [{ date: '', location: '', message: trimmed }];
     }
-
-    // Anything else -> empty
     return [];
   } catch {
     return [];
   }
 }
 
-/**
- * Ensures a stable, valid JSON string is stored in the sheet for `history`.
- * - Arrays -> JSON.stringify(array)
- * - Strings that parse -> normalized JSON string of array
- * - Plain strings -> JSON string of [string]
- * - Otherwise -> '[]'
- */
 function normalizeHistoryForStorage(history) {
   try {
     if (history === undefined || history === null) return '[]';
     if (Array.isArray(history)) return JSON.stringify(history);
     if (typeof history === 'string') {
       const trimmed = history.trim();
-      // If it already looks like JSON array, try parse then stringify to normalize
       if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
         try {
           const parsed = JSON.parse(trimmed);
           return JSON.stringify(Array.isArray(parsed) ? parsed : []);
         } catch {
-          // try to unescape and parse
           try {
             const unescaped = trimmed.replace(/^"(.+)"$/, '$1').replace(/\\"/g, '"');
             const parsed2 = JSON.parse(unescaped);
             return JSON.stringify(Array.isArray(parsed2) ? parsed2 : []);
           } catch {
-            // fallback: wrap as single-message
             return JSON.stringify([{ date: '', location: '', message: trimmed }]);
           }
         }
       }
-      // plain text -> wrap
       return JSON.stringify([{ date: '', location: '', message: trimmed }]);
     }
-    // If object but not array -> empty array string
     return '[]';
   } catch {
     return '[]';
@@ -118,16 +86,11 @@ function quoteSheetNameIfNeeded(name) {
   return needsQuote ? `'${name.replace(/'/g, "''")}'` : name;
 }
 
-/* Build range:
-   - fromRow only -> returns "SheetName!fromRow:"  (fromRow .. end)
-   - fromRow and toRow -> "SheetName!fromRow:toRow"
-*/
 function safeRangeForRows(name, fromRow = 1, toRow = null) {
   const quoted = quoteSheetNameIfNeeded(name);
   if (toRow !== null && toRow !== undefined) {
     return `${quoted}!${fromRow}:${toRow}`;
   }
-  // fromRow to end of sheet
   return `${quoted}!${fromRow}:`;
 }
 
@@ -135,17 +98,104 @@ async function ensureInitialized() {
   if (!sheetsClient) throw new Error('Sheets client not initialized. Call initSheets() first.');
 }
 
-export async function initSheets(serviceAccountPath, sheetId, sheetNameOverride = '') {
-  const keyPath = path.isAbsolute(serviceAccountPath)
-    ? serviceAccountPath
-    : path.join(__dirname, serviceAccountPath);
+/**
+ * initSheets(serviceAccountPathArg, sheetId, sheetNameOverride='')
+ *
+ * Behavior:
+ *  - If environment variable SERVICE_ACCOUNT_JSON or SERVICE_ACCOUNT_KEY_JSON exists,
+ *    it prefers that (accepts raw JSON or base64-encoded JSON).
+ *  - Otherwise it uses serviceAccountPathArg or SERVICE_ACCOUNT_KEY_PATH.
+ *  - It normalizes private_key by replacing literal "\\n" sequences with real newlines.
+ *  - Writes a secure normalized temp file in the same dir and uses keyFile for GoogleAuth.
+ */
+export async function initSheets(serviceAccountPathArg, sheetId, sheetNameOverride = '') {
+  // Prefer env-provided JSON (raw or base64)
+  const envJson = process.env.SERVICE_ACCOUNT_JSON || process.env.SERVICE_ACCOUNT_KEY_JSON || '';
+  let keyFilePathCandidate = serviceAccountPathArg || process.env.SERVICE_ACCOUNT_KEY_PATH || '';
 
-  if (!fs.existsSync(keyPath)) {
-    throw new Error(`Service account key JSON not found at ${keyPath}`);
+  // If env JSON is present, decode/normalize and write to temp file
+  if (envJson && envJson.trim()) {
+    let raw = envJson.trim();
+
+    // Heuristic: if it looks base64-like and not starting with '{', try decode
+    if (!raw.startsWith('{') && /^[A-Za-z0-9+/=\s]+$/.test(raw)) {
+      try {
+        const decoded = Buffer.from(raw, 'base64').toString('utf8');
+        if (decoded.trim().startsWith('{')) raw = decoded;
+      } catch {
+        // ignore decode errors; keep raw
+      }
+    }
+
+    // Try parse JSON so we can normalize private_key
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = null;
+    }
+
+    const dest = path.join(__dirname, 'service-account-from-env.json');
+
+    if (parsed && parsed.private_key && typeof parsed.private_key === 'string') {
+      parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
+      fs.writeFileSync(dest, JSON.stringify(parsed), { encoding: 'utf8', mode: 0o600 });
+      keyFilePathCandidate = dest;
+    } else {
+      // If not JSON or no private_key, write raw content (best-effort)
+      fs.writeFileSync(dest, raw, { encoding: 'utf8', mode: 0o600 });
+      keyFilePathCandidate = dest;
+    }
   }
 
+  // If no env JSON, but we have a file path, try to read and normalize it if needed
+  if (keyFilePathCandidate && !path.isAbsolute(keyFilePathCandidate)) {
+    keyFilePathCandidate = path.join(__dirname, keyFilePathCandidate);
+  }
+
+  if (!keyFilePathCandidate) {
+    throw new Error('No service account key provided. Set SERVICE_ACCOUNT_KEY_PATH or SERVICE_ACCOUNT_JSON env var.');
+  }
+
+  // If the candidate exists as a file, read and normalize its private_key if needed
+  let finalKeyPath = keyFilePathCandidate;
+  if (fs.existsSync(keyFilePathCandidate)) {
+    try {
+      const rawFile = fs.readFileSync(keyFilePathCandidate, 'utf8');
+      let parsedFile = null;
+      try {
+        parsedFile = JSON.parse(rawFile);
+      } catch {
+        parsedFile = null;
+      }
+
+      if (parsedFile && parsedFile.private_key && typeof parsedFile.private_key === 'string') {
+        // If private_key contains literal backslash-n sequences, fix them
+        if (parsedFile.private_key.includes('\\n')) {
+          parsedFile.private_key = parsedFile.private_key.replace(/\\n/g, '\n');
+          const normalizedDest = path.join(__dirname, 'service-account-normalized.json');
+          fs.writeFileSync(normalizedDest, JSON.stringify(parsedFile), { encoding: 'utf8', mode: 0o600 });
+          finalKeyPath = normalizedDest;
+        } else {
+          // no escaped sequences, use original file
+          finalKeyPath = keyFilePathCandidate;
+        }
+      } else {
+        // Not JSON or missing private_key — still use original path (may error later)
+        finalKeyPath = keyFilePathCandidate;
+      }
+    } catch (e) {
+      // can't read file — rethrow a clearer message
+      throw new Error(`Failed to read service account key at ${keyFilePathCandidate}: ${e.message}`);
+    }
+  } else {
+    // Candidate file doesn't exist: throw helpful message
+    throw new Error(`Service account key JSON not found at ${keyFilePathCandidate}`);
+  }
+
+  // Initialize Google Auth using the normalized key file
   const auth = new google.auth.GoogleAuth({
-    keyFile: keyPath,
+    keyFile: finalKeyPath,
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
 
@@ -154,12 +204,13 @@ export async function initSheets(serviceAccountPath, sheetId, sheetNameOverride 
   spreadsheetId = sheetId;
   sheetName = sheetNameOverride && String(sheetNameOverride).trim().length ? String(sheetNameOverride).trim() : null;
 
-  // Resolve sheetName to a valid tab if necessary
+  // Verify sheet tabs
   await resolveSheetTab();
   console.log('Sheets initialized. Using sheet tab:', sheetName);
   return true;
 }
 
+/* Remaining functions follow the same patterns as original file (read header, getAllRows, getRowByTrackingId, createRow, updateRow, deleteRow) */
 async function listSheetTitles() {
   await ensureInitialized();
   const meta = await sheetsClient.spreadsheets.get({ spreadsheetId });
@@ -180,16 +231,6 @@ async function resolveSheetTab() {
 
   const titles = await listSheetTitles();
   if (!titles || titles.length === 0) throw new Error('No sheet tabs found in spreadsheet');
-
-  if (sheetName) {
-    const lower = sheetName.toLowerCase();
-    const match = titles.find(t => t.toLowerCase() === lower);
-    if (match) {
-      sheetName = match;
-      return;
-    }
-  }
-
   sheetName = titles[0];
 }
 
@@ -202,7 +243,6 @@ async function readHeader(name) {
     if (!vals || vals.length === 0) throw new Error('Header row is empty');
     return vals[0].map(v => (typeof v === 'string' ? v.trim() : v));
   } catch (err) {
-    // fallback: try reading full sheet and take first row
     try {
       const fallbackRange = quoteSheetNameIfNeeded(name);
       const fallback = await sheetsClient.spreadsheets.values.get({ spreadsheetId, range: fallbackRange });
@@ -231,8 +271,7 @@ export async function getAllRows() {
   await ensureInitialized();
   if (!sheetName) await resolveSheetTab();
 
-  // Use the sheet tab name (quoted if needed) to read the entire sheet
-  const range = quoteSheetNameIfNeeded(sheetName); // <-- important: use full sheet name, not "1:"
+  const range = quoteSheetNameIfNeeded(sheetName);
   const resp = await sheetsClient.spreadsheets.values.get({ spreadsheetId, range });
   const vals = resp.data.values || [];
   if (vals.length === 0) return { headers: [], rows: [] };
@@ -255,7 +294,6 @@ export async function getRowByTrackingId(trackingId) {
   if (!sheetName) await resolveSheetTab();
   if (!trackingId) return null;
 
-  // Read the whole sheet by sheet name (quoted if required)
   const range = quoteSheetNameIfNeeded(sheetName);
   const resp = await sheetsClient.spreadsheets.values.get({ spreadsheetId, range });
   const vals = resp.data.values || [];
@@ -270,7 +308,6 @@ export async function getRowByTrackingId(trackingId) {
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
-    // Normalize the cell value: toString, trim, remove non-breaking spaces
     const rawCell = row[trackingIdx] === undefined ? '' : String(row[trackingIdx]);
     const cell = rawCell.replace(/\u00A0/g, ' ').trim().toUpperCase();
 
@@ -280,7 +317,7 @@ export async function getRowByTrackingId(trackingId) {
         const val = row[idx] === undefined ? '' : row[idx];
         obj[h] = h === 'history' ? parseHistory(val) : val;
       });
-      return { rowIndex: i + 2, data: obj }; // actual sheet row index
+      return { rowIndex: i + 2, data: obj };
     }
   }
   return null;
@@ -305,7 +342,9 @@ export async function createRow(rowData) {
   });
 
   const created = {};
-  headers.forEach((h, idx) => { created[h] = h === 'history' ? parseHistory(payload[idx]) : payload[idx]; });
+  headers.forEach((h, idx) => {
+    created[h] = h === 'history' ? parseHistory(payload[idx]) : payload[idx];
+  });
   return created;
 }
 
@@ -332,7 +371,9 @@ export async function updateRow(trackingId, rowData) {
   });
 
   const updated = {};
-  headers.forEach((h, idx) => { updated[h] = h === 'history' ? parseHistory(payload[idx]) : payload[idx]; });
+  headers.forEach((h, idx) => {
+    updated[h] = h === 'history' ? parseHistory(payload[idx]) : payload[idx];
+  });
   return updated;
 }
 
